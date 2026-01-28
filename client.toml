@@ -1,0 +1,13 @@
+# Endereço do Servidor de Proxy (IP ou Domínio)
+server_ip = "186.232.119.33"
+
+# Token de Matrícula (Define a qual grupo este cliente pertencerá)
+# O servidor usa isso para autorizar e gerar o certificado mTLS automaticamente
+token = "ae686052c2fd5a162ee55a2dc4520adc"
+
+#Nome de matricula
+name = "LVN-PROXY"
+# Configurações de Conexão
+control_port = ":8081"   # Porta do Túnel mTLS
+enroll_port  = ":8082"   # Porta para pegar o certificado
+reconnect_delay = 5      # Segundos para tentar reconectar
