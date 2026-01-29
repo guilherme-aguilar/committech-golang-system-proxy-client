@@ -1,22 +1,37 @@
 #!/bin/bash
-# Arquivo: setup.sh do Client
+# Uso: curl -sL https://seu-repo/setup.sh | bash
 
-REPO="guilherme-aguilar/committech-golang-system-proxy-client
-FILE_PREFIX="proxy-client-linux"
+REPO="guilherme-aguilar/committech-golang-system-proxy-manager" # Ajuste se for outro repo
+PROJECT="proxy-client"
 
-echo "🔍 Buscando última versão..."
-LATEST=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+echo ">>> Iniciando Instalador do Client..."
 
-if [ -z "$LATEST" ]; then echo "Erro: Nenhuma release encontrada"; exit 1; fi
+# Detecta arquitetura (simples, assume amd64 linux por enquanto baseado no seu release)
+OS="linux"
+ARCH="amd64"
 
-URL="https://github.com/$REPO/releases/download/$LATEST/$FILE_PREFIX-$LATEST.tar.gz"
-TMP=$(mktemp -d)
+# Busca última release via API do GitHub
+echo "🔍 Buscando versão mais recente..."
+LATEST_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep "browser_download_url" | grep "$PROJECT-$OS" | cut -d '"' -f 4)
 
-echo "⬇️  Baixando $LATEST..."
-curl -sL -o "$TMP/client.tar.gz" "$URL"
+if [ -z "$LATEST_URL" ]; then
+    echo "Erro: Não foi possível encontrar a release."
+    exit 1
+fi
 
-tar -xzf "$TMP/client.tar.gz" -C "$TMP"
-cd "$TMP"
-bash install.sh
+FILENAME=$(basename "$LATEST_URL")
 
-rm -rf "$TMP"
+echo "⬇️  Baixando $FILENAME..."
+wget -q --show-progress "$LATEST_URL"
+
+echo "📦 Extraindo..."
+tar -xzf "$FILENAME"
+cd "$PROJECT"
+
+echo "🚀 Executando instalação..."
+chmod +x install.sh
+sudo ./install.sh
+
+# Limpeza
+cd ..
+rm -rf "$PROJECT" "$FILENAME"

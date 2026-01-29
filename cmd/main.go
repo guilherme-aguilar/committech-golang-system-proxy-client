@@ -19,28 +19,35 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
-// Estrutura do arquivo TOML
+// --- CONFIGURAÇÕES ---
+
+const (
+	CertDir    = "certs"
+	CaFile     = "certs/ca.crt"
+	ClientCert = "certs/client.crt"
+	ClientKey  = "certs/client.key"
+)
+
 type Config struct {
 	ServerIP       string `toml:"server_ip"`
 	Token          string `toml:"token"`
-	Name           string `toml:"name"` // Identidade única
+	Name           string `toml:"name"`
 	ControlPort    string `toml:"control_port"`
 	EnrollPort     string `toml:"enroll_port"`
 	ReconnectDelay int    `toml:"reconnect_delay"`
 }
 
 func main() {
-	// Flags para override
-	flagPath := flag.String("config", "client.toml", "Caminho do arquivo de configuração")
-	flagIP := flag.String("server", "", "Sobrescreve o IP do servidor")
-	flagToken := flag.String("token", "", "Sobrescreve o Token")
-	flagName := flag.String("name", "", "Sobrescreve o Nome da Proxy")
+	// 1. Configuração
+	flagPath := flag.String("config", "client.toml", "Caminho do arquivo TOML")
+	flagIP := flag.String("server", "", "Sobrescreve Server IP")
+	flagToken := flag.String("token", "", "Sobrescreve Token")
+	flagName := flag.String("name", "", "Sobrescreve Nome")
 	flag.Parse()
 
-	// 1. Carregar Configuração
 	cfg := loadConfig(*flagPath)
 
-	// Aplicar Overrides
+	// Overrides
 	if *flagIP != "" {
 		cfg.ServerIP = *flagIP
 	}
@@ -51,137 +58,141 @@ func main() {
 		cfg.Name = *flagName
 	}
 
-	// Validações
-	if cfg.Token == "" {
-		log.Fatal("Erro: Token é obrigatório")
-	}
-	if cfg.ServerIP == "" {
-		log.Fatal("Erro: Server IP é obrigatório")
-	}
-
-	// Gera nome automático se estiver vazio
 	if cfg.Name == "" {
 		host, _ := os.Hostname()
 		cfg.Name = "proxy-" + host
-		log.Printf("[Config] Nome não definido, usando: %s", cfg.Name)
 	}
 
-	// 2. BOOTSTRAP: Garantir que temos a CA do servidor
-	// Se não tivermos, baixamos agora.
-	if err := ensureCACertificate(cfg.ServerIP, cfg.EnrollPort); err != nil {
-		log.Fatalf("[Boot] Falha fatal ao obter certificado CA: %v", err)
+	if cfg.ServerIP == "" || cfg.Token == "" {
+		log.Fatal("❌ Erro: 'server_ip' e 'token' são obrigatórios.")
 	}
 
-	enrollURL := fmt.Sprintf("https://%s%s/enroll", cfg.ServerIP, cfg.EnrollPort)
+	log.Printf("[Init] Iniciando Agente: %s -> %s", cfg.Name, cfg.ServerIP)
+
+	// Cria pasta certs se não existir
+	ensureCertDir()
+
+	// 2. BOOTSTRAP: Garantir CA (Loop de Retry)
+	for {
+		if err := ensureCACertificate(cfg.ServerIP, cfg.EnrollPort); err != nil {
+			log.Printf("[Boot] ⚠️  Falha ao baixar CA: %v. Tentando em 5s...", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		break
+	}
+
+	// 3. AUTENTICAÇÃO: Carregar do disco OU Matricular (Loop de Retry)
+	var clientIdentity tls.Certificate
+	var err error
+
+	for {
+		clientIdentity, err = loadOrEnroll(cfg)
+		if err != nil {
+			log.Printf("[Auth] ⚠️  Falha na autenticação: %v. Tentando em 5s...", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		break
+	}
+
+	// 4. CONEXÃO: Túnel (Loop Infinito)
 	tunnelAddr := fmt.Sprintf("%s%s", cfg.ServerIP, cfg.ControlPort)
 
-	log.Printf("[Init] Iniciando %s -> %s", cfg.Name, cfg.ServerIP)
-
-	// 3. Matrícula (Enrollment)
-	log.Println("[Enroll] Solicitando certificado mTLS...")
-	clientCert, err := enroll(cfg.Token, cfg.Name, enrollURL)
-	if err != nil {
-		log.Fatalf("[Enroll] Falha fatal: %v", err)
-	}
-	log.Println("[Enroll] Identidade recebida com sucesso!")
-
-	// 4. Loop de Conexão (Túnel)
 	for {
-		log.Printf("[Conn] Conectando ao túnel %s...", tunnelAddr)
-		err := connectTunnel(tunnelAddr, clientCert)
+		log.Printf("[Tunnel] 🔌 Conectando a %s...", tunnelAddr)
+		err := connectTunnel(tunnelAddr, clientIdentity)
 
-		log.Printf("[Err] Desconectado: %v", err)
-		log.Printf("[Wait] Reconectando em %ds...", cfg.ReconnectDelay)
+		log.Printf("[Tunnel] ❌ Desconectado: %v", err)
+		log.Printf("[Tunnel] ⏳ Reconectando em %ds...", cfg.ReconnectDelay)
 		time.Sleep(time.Duration(cfg.ReconnectDelay) * time.Second)
 	}
 }
 
-// --- FUNÇÃO DE BOOTSTRAP (NOVO) ---
-func ensureCACertificate(serverIP, port string) error {
-	path := "certs/ca.crt"
+// --- FUNÇÕES DE ARQUIVO E CERTIFICADO ---
 
-	// Se o arquivo já existe, tudo certo
-	if _, err := os.Stat(path); err == nil {
+func ensureCertDir() {
+	if _, err := os.Stat(CertDir); os.IsNotExist(err) {
+		os.MkdirAll(CertDir, 0755)
+	}
+}
+
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return !info.IsDir()
+}
+
+// ensureCACertificate baixa o CA público se ele não existir
+func ensureCACertificate(serverIP, port string) error {
+	if fileExists(CaFile) {
 		return nil
 	}
 
-	log.Println("[Boot] Certificado CA não encontrado. Baixando do servidor...")
-
-	// Cria a pasta certs se não existir
-	if err := os.MkdirAll("certs", 0755); err != nil {
-		return fmt.Errorf("erro criando pasta certs: %v", err)
-	}
-
-	// URL de Download
 	url := fmt.Sprintf("https://%s%s/ca.crt", serverIP, port)
+	log.Printf("[Boot] 📥 Baixando CA de %s...", url)
 
-	// Cliente HTTP Inseguro (Só para este primeiro download)
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
+	// Cliente inseguro APENAS para baixar a CA pública (Bootstrap)
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 
 	resp, err := client.Get(url)
 	if err != nil {
-		return fmt.Errorf("erro ao baixar CA: %v", err)
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("servidor retornou erro %d ao baixar CA", resp.StatusCode)
+		return fmt.Errorf("status HTTP %d", resp.StatusCode)
 	}
 
-	// Salva no disco
-	out, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("erro ao salvar arquivo CA: %v", err)
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
 
-	log.Println("[Boot] Certificado CA baixado e salvo com sucesso!")
-	return nil
+	return os.WriteFile(CaFile, data, 0644)
 }
 
-// Helper para carregar a CA do disco
-func loadLocalCA() (*x509.CertPool, error) {
-	certData, err := os.ReadFile("certs/ca.crt")
-	if err != nil {
-		return nil, fmt.Errorf("erro lendo certs/ca.crt: %v", err)
+// loadOrEnroll tenta ler do disco. Se falhar, pede novo para o servidor.
+func loadOrEnroll(cfg Config) (tls.Certificate, error) {
+	// A) Tenta carregar do disco
+	if fileExists(ClientCert) && fileExists(ClientKey) {
+		cert, err := tls.LoadX509KeyPair(ClientCert, ClientKey)
+		if err == nil {
+			// Verifica validade
+			x509Cert, _ := x509.ParseCertificate(cert.Certificate[0])
+			if time.Now().Before(x509Cert.NotAfter) {
+				log.Println("[Auth] ✅ Identidade válida carregada do disco.")
+				return cert, nil
+			}
+			log.Println("[Auth] ⚠️  Certificado expirou. Renovando...")
+		} else {
+			log.Printf("[Auth] ⚠️  Certificado corrompido: %v", err)
+		}
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(certData) {
-		return nil, fmt.Errorf("falha ao decodificar PEM do CA")
-	}
-	return pool, nil
-}
 
-// Solicita o certificado ao servidor enviando Token e Nome
-func enroll(token, name, url string) (tls.Certificate, error) {
-	// Carrega CA do disco
+	// B) Matrícula (Enroll)
+	log.Println("[Enroll] 📝 Solicitando novo certificado...")
+	enrollURL := fmt.Sprintf("https://%s%s/enroll", cfg.ServerIP, cfg.EnrollPort)
+
 	caPool, err := loadLocalCA()
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 
+	// Configura cliente com a CA que acabamos de baixar
 	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{RootCAs: caPool},
-		},
-		Timeout: 10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: caPool}},
+		Timeout:   10 * time.Second,
 	}
 
-	payload := map[string]string{
-		"token": token,
-		"name":  name,
-	}
+	payload := map[string]string{"token": cfg.Token, "name": cfg.Name}
 	jsonData, _ := json.Marshal(payload)
 
-	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := client.Post(enrollURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -189,45 +200,59 @@ func enroll(token, name, url string) (tls.Certificate, error) {
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		return tls.Certificate{}, fmt.Errorf("Status %d: %s", resp.StatusCode, body)
+		return tls.Certificate{}, fmt.Errorf("erro servidor: %s", body)
 	}
 
-	var res struct {
-		Cert string
-		Key  string
-	}
+	var res struct{ Cert, Key string }
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return tls.Certificate{}, err
 	}
 
+	// C) Salva no disco
+	os.WriteFile(ClientCert, []byte(res.Cert), 0644)
+	os.WriteFile(ClientKey, []byte(res.Key), 0600)
+	log.Println("[Enroll] 💾 Certificados salvos com sucesso!")
+
 	return tls.X509KeyPair([]byte(res.Cert), []byte(res.Key))
 }
 
-// Conecta ao túnel mTLS
+func loadLocalCA() (*x509.CertPool, error) {
+	data, err := os.ReadFile(CaFile)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("falha ao ler CA")
+	}
+	return pool, nil
+}
+
+// --- LÓGICA DO TÚNEL ---
+
 func connectTunnel(addr string, cert tls.Certificate) error {
-	// Carrega CA do disco
 	caPool, err := loadLocalCA()
 	if err != nil {
 		return err
 	}
 
-	config := &tls.Config{
+	// Conecta mTLS
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      caPool,
-	}
-
-	conn, err := tls.Dial("tcp", addr, config)
+	})
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 
+	// Inicia Yamux Server (Client side age como Server no multiplexing)
 	session, err := yamux.Server(conn, nil)
 	if err != nil {
+		conn.Close()
 		return err
 	}
 
-	log.Println("[Tunnel] 🔒 Conectado e aguardando requisições.")
+	log.Println("[Tunnel] 🔒 Conexão Segura Estabelecida! Aguardando comandos...")
 
 	for {
 		stream, err := session.Accept()
@@ -238,51 +263,63 @@ func connectTunnel(addr string, cert tls.Certificate) error {
 	}
 }
 
-// Processa a requisição que veio do servidor
 func handleStream(stream net.Conn) {
 	defer stream.Close()
 
-	stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	// Timeout para ler o cabeçalho inicial do pedido
+	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	br := bufio.NewReader(stream)
 	req, err := http.ReadRequest(br)
-	stream.SetReadDeadline(time.Time{}) // Remove timeout
+	stream.SetReadDeadline(time.Time{}) // Remove timeout para o resto da conexão
 
 	if err != nil {
 		return
 	}
 
-	log.Printf("[Request] %s %s", req.Method, req.Host)
+	log.Printf("[Traffic] %s %s", req.Method, req.Host)
 
 	if req.Method == http.MethodConnect {
-		// HTTPS / TCP Forwarding
-		dest, err := net.DialTimeout("tcp", req.Host, 10*time.Second)
-		if err != nil {
-			return
-		}
-		defer dest.Close()
-		go io.Copy(dest, stream)
-		io.Copy(stream, dest)
+		handleHTTPS(stream, req)
 	} else {
-		// HTTP Forwarding
-		client := &http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-			Timeout: 30 * time.Second,
-		}
-
-		req.RequestURI = ""
-		req.URL.Scheme = "http"
-		req.URL.Host = req.Host
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-
-		resp.Write(stream)
+		handleHTTP(stream, req)
 	}
+}
+
+func handleHTTPS(stream net.Conn, req *http.Request) {
+	dest, err := net.DialTimeout("tcp", req.Host, 10*time.Second)
+	if err != nil {
+		return
+	}
+	defer dest.Close()
+
+	stream.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+
+	// Proxy Bidirecional
+	errChan := make(chan error, 2)
+	go func() { _, err := io.Copy(dest, stream); errChan <- err }()
+	go func() { _, err := io.Copy(stream, dest); errChan <- err }()
+	<-errChan
+}
+
+func handleHTTP(stream net.Conn, req *http.Request) {
+	client := &http.Client{
+		// Não segue redirects (devolve pro navegador resolver)
+		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
+		Timeout:       30 * time.Second,
+	}
+
+	// Limpa URI para evitar erro do Go Client
+	req.RequestURI = ""
+	req.URL.Scheme = "http"
+	req.URL.Host = req.Host
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	resp.Write(stream)
 }
 
 func loadConfig(path string) Config {
@@ -291,7 +328,7 @@ func loadConfig(path string) Config {
 		EnrollPort:     ":8082",
 		ReconnectDelay: 5,
 	}
-	if _, err := os.Stat(path); err == nil {
+	if fileExists(path) {
 		toml.DecodeFile(path, &cfg)
 	}
 	return cfg

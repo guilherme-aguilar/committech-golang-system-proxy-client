@@ -1,38 +1,98 @@
 #!/bin/bash
-# Arquivo: scripts/install_linux.sh
+
+# Cores
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
 APP_NAME="proxy-client"
-INSTALL_DIR="/opt/proxy-client"
 SERVICE_NAME="proxy-client"
+INSTALL_DIR="/opt/proxy-client"
+CERT_DIR="$INSTALL_DIR/certs"
+USER="proxyclient"
 
-if [ "$EUID" -ne 0 ]; then echo "Rode como root"; exit 1; fi
+echo -e "${BLUE}>>> Instalação do Proxy Client...${NC}"
 
-echo "Instalando Client..."
+# 1. Root Check
+if [ "$EUID" -ne 0 ]; then 
+    echo -e "${RED}Erro: Rode como root (sudo).${NC}"
+    exit 1
+fi
+
+# 2. Validação do Pacote
+if [[ ! -f "$APP_NAME" ]]; then
+    echo -e "${RED}Erro: Binário '$APP_NAME' não encontrado.${NC}"
+    exit 1
+fi
+
+# 3. Parar serviço antigo
 systemctl stop $SERVICE_NAME &>/dev/null
 
-mkdir -p $INSTALL_DIR
-cp $APP_NAME $INSTALL_DIR/
-chmod +x $INSTALL_DIR/$APP_NAME
+# 4. Criar usuário
+if ! id "$USER" &>/dev/null; then 
+    echo "👤 Criando usuário de serviço: $USER"
+    useradd -r -s /bin/false $USER
+fi
 
-# Cria serviço (Ajuste os argumentos se precisar passar IP via flag)
+# 5. Estrutura de Pastas
+mkdir -p $INSTALL_DIR
+mkdir -p $CERT_DIR
+
+# 6. Copiar Binário
+echo "📦 Atualizando binário..."
+cp -f "$APP_NAME" "$INSTALL_DIR/"
+
+# 7. Preservação de Configuração (Crucial para não perder o Token)
+if [ -f "$INSTALL_DIR/client.toml" ]; then
+    echo -e "${YELLOW}⚙️  Configuração existente preservada.${NC}"
+    cp "client.toml" "$INSTALL_DIR/client.toml.new"
+    echo "   -> Novo config salvo como 'client.toml.new'"
+else
+    echo -e "${GREEN}⚙️  Instalando configuração padrão.${NC}"
+    cp "client.toml" "$INSTALL_DIR/"
+fi
+
+# 8. Permissões
+chown -R $USER:$USER $INSTALL_DIR
+chmod +x "$INSTALL_DIR/$APP_NAME"
+chmod 700 "$CERT_DIR" # Protege certificados
+
+# 9. SystemD
+echo "🔧 Configurando serviço..."
 cat <<EOF > /etc/systemd/system/$SERVICE_NAME.service
 [Unit]
-Description=Proxy Client Service
-After=network.target
+Description=Proxy Manager Client Agent
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=$INSTALL_DIR/$APP_NAME
-Restart=always
+User=$USER
+Group=$USER
 WorkingDirectory=$INSTALL_DIR
-StandardOutput=journal
-StandardError=journal
+ExecStart=$INSTALL_DIR/$APP_NAME
+# Reinicia sempre, pois o client deve tentar reconectar se cair
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable $SERVICE_NAME
+systemctl enable $SERVICE_NAME >/dev/null
 systemctl start $SERVICE_NAME
 
-echo "✅ Client rodando!"
+sleep 2
+
+if systemctl is-active --quiet $SERVICE_NAME; then
+    echo -e "${GREEN}✅ INSTALAÇÃO CONCLUÍDA!${NC}"
+    echo "Edite o token em: nano $INSTALL_DIR/client.toml"
+    echo "Reinicie após editar: systemctl restart $SERVICE_NAME"
+    echo "Logs: journalctl -u $SERVICE_NAME -f"
+else
+    echo -e "${RED}❌ Erro ao iniciar serviço.${NC}"
+    exit 1
+fi

@@ -3,7 +3,7 @@ server_ip = "186.232.119.33"
 
 # Token de Matrícula (Define a qual grupo este cliente pertencerá)
 # O servidor usa isso para autorizar e gerar o certificado mTLS automaticamente
-token = "ae686052c2fd5a162ee55a2dc4520adc"
+token = "$2a$14$x1nvgIm8T"
 
 #Nome de matricula
 name = "LVN-PROXY"
