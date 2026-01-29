@@ -1,7 +1,7 @@
 #!/bin/bash
 # Uso: curl -sL https://seu-repo/setup.sh | bash
 
-REPO="guilherme-aguilar/committech-golang-system-client" # Ajuste se for outro repo
+REPO="guilherme-aguilar/committech-golang-system-proxy-client" # Ajuste se for outro repo
 PROJECT="proxy-client"
 
 echo ">>> Iniciando Instalador do Client..."
