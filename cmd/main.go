@@ -134,7 +134,6 @@ func ensureCACertificate(serverIP, port string) error {
 	url := fmt.Sprintf("https://%s%s/ca.crt", serverIP, port)
 	log.Printf("[Boot] 📥 Baixando CA de %s...", url)
 
-	// Cliente inseguro APENAS para baixar a CA pública (Bootstrap)
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 
@@ -156,25 +155,40 @@ func ensureCACertificate(serverIP, port string) error {
 	return os.WriteFile(CaFile, data, 0644)
 }
 
-// loadOrEnroll tenta ler do disco. Se falhar, pede novo para o servidor.
+// loadOrEnroll tenta ler do disco. Se falhar ou NOME MUDAR, pede novo.
 func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 	// A) Tenta carregar do disco
 	if fileExists(ClientCert) && fileExists(ClientKey) {
 		cert, err := tls.LoadX509KeyPair(ClientCert, ClientKey)
 		if err == nil {
-			// Verifica validade
+			// Parse do x509 para checar validade e NOME
 			x509Cert, _ := x509.ParseCertificate(cert.Certificate[0])
-			if time.Now().Before(x509Cert.NotAfter) {
+
+			// 1. Checa Validade (Data)
+			isExpired := time.Now().After(x509Cert.NotAfter)
+
+			// 2. Checa se o Nome mudou (CORREÇÃO DO BUG)
+			isNameMismatch := x509Cert.Subject.CommonName != cfg.Name
+
+			if !isExpired && !isNameMismatch {
 				log.Println("[Auth] ✅ Identidade válida carregada do disco.")
 				return cert, nil
 			}
-			log.Println("[Auth] ⚠️  Certificado expirou. Renovando...")
+
+			if isExpired {
+				log.Println("[Auth] ⚠️  Certificado expirou. Renovando...")
+			}
+			if isNameMismatch {
+				log.Printf("[Auth] ⚠️  Nome alterado (De: '%s' Para: '%s'). Renovando...",
+					x509Cert.Subject.CommonName, cfg.Name)
+			}
+
 		} else {
 			log.Printf("[Auth] ⚠️  Certificado corrompido: %v", err)
 		}
 	}
 
-	// B) Matrícula (Enroll)
+	// B) Matrícula (Enroll) - Só chega aqui se não existir ou for inválido/mudado
 	log.Println("[Enroll] 📝 Solicitando novo certificado...")
 	enrollURL := fmt.Sprintf("https://%s%s/enroll", cfg.ServerIP, cfg.EnrollPort)
 
@@ -183,7 +197,6 @@ func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 
-	// Configura cliente com a CA que acabamos de baixar
 	client := &http.Client{
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: caPool}},
 		Timeout:   10 * time.Second,
@@ -236,7 +249,6 @@ func connectTunnel(addr string, cert tls.Certificate) error {
 		return err
 	}
 
-	// Conecta mTLS
 	conn, err := tls.Dial("tcp", addr, &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      caPool,
@@ -245,7 +257,6 @@ func connectTunnel(addr string, cert tls.Certificate) error {
 		return err
 	}
 
-	// Inicia Yamux Server (Client side age como Server no multiplexing)
 	session, err := yamux.Server(conn, nil)
 	if err != nil {
 		conn.Close()
@@ -266,11 +277,10 @@ func connectTunnel(addr string, cert tls.Certificate) error {
 func handleStream(stream net.Conn) {
 	defer stream.Close()
 
-	// Timeout para ler o cabeçalho inicial do pedido
 	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	br := bufio.NewReader(stream)
 	req, err := http.ReadRequest(br)
-	stream.SetReadDeadline(time.Time{}) // Remove timeout para o resto da conexão
+	stream.SetReadDeadline(time.Time{})
 
 	if err != nil {
 		return
@@ -294,7 +304,6 @@ func handleHTTPS(stream net.Conn, req *http.Request) {
 
 	stream.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 
-	// Proxy Bidirecional
 	errChan := make(chan error, 2)
 	go func() { _, err := io.Copy(dest, stream); errChan <- err }()
 	go func() { _, err := io.Copy(stream, dest); errChan <- err }()
@@ -303,12 +312,10 @@ func handleHTTPS(stream net.Conn, req *http.Request) {
 
 func handleHTTP(stream net.Conn, req *http.Request) {
 	client := &http.Client{
-		// Não segue redirects (devolve pro navegador resolver)
 		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 		Timeout:       30 * time.Second,
 	}
 
-	// Limpa URI para evitar erro do Go Client
 	req.RequestURI = ""
 	req.URL.Scheme = "http"
 	req.URL.Host = req.Host

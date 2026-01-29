@@ -6,7 +6,7 @@ server_ip = "186.232.119.33"
 token = "$2a$14$x1nvgIm8T"
 
 #Nome de matricula
-name = "LVN-PROXY"
+name = "CMT-PROXY"
 # Configurações de Conexão
 control_port = ":8081"   # Porta do Túnel mTLS
 enroll_port  = ":8082"   # Porta para pegar o certificado
