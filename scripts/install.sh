@@ -17,13 +17,14 @@ echo -e "${BLUE}>>> Instalação do Proxy Client...${NC}"
 
 # 1. Root Check
 if [ "$EUID" -ne 0 ]; then 
-    echo -e "${RED}Erro: Rode como root (sudo).${NC}"
+    echo -e "${RED}Erro: Rode como root.${NC}"
     exit 1
 fi
 
-# 2. Validação do Pacote
+# 2. Validação do Pacote (Confirma se o binário está na pasta atual)
 if [[ ! -f "$APP_NAME" ]]; then
-    echo -e "${RED}Erro: Binário '$APP_NAME' não encontrado.${NC}"
+    echo -e "${RED}Erro: Binário '$APP_NAME' não encontrado na pasta atual.${NC}"
+    ls -l
     exit 1
 fi
 
@@ -44,11 +45,10 @@ mkdir -p $CERT_DIR
 echo "📦 Atualizando binário..."
 cp -f "$APP_NAME" "$INSTALL_DIR/"
 
-# 7. Preservação de Configuração (Crucial para não perder o Token)
+# 7. Preservação de Configuração
 if [ -f "$INSTALL_DIR/client.toml" ]; then
     echo -e "${YELLOW}⚙️  Configuração existente preservada.${NC}"
     cp "client.toml" "$INSTALL_DIR/client.toml.new"
-    echo "   -> Novo config salvo como 'client.toml.new'"
 else
     echo -e "${GREEN}⚙️  Instalando configuração padrão.${NC}"
     cp "client.toml" "$INSTALL_DIR/"
@@ -57,7 +57,7 @@ fi
 # 8. Permissões
 chown -R $USER:$USER $INSTALL_DIR
 chmod +x "$INSTALL_DIR/$APP_NAME"
-chmod 700 "$CERT_DIR" # Protege certificados
+chmod 700 "$CERT_DIR"
 
 # 9. SystemD
 echo "🔧 Configurando serviço..."
@@ -72,7 +72,6 @@ User=$USER
 Group=$USER
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/$APP_NAME
-# Reinicia sempre, pois o client deve tentar reconectar se cair
 Restart=always
 RestartSec=10
 LimitNOFILE=65536
@@ -90,9 +89,8 @@ sleep 2
 if systemctl is-active --quiet $SERVICE_NAME; then
     echo -e "${GREEN}✅ INSTALAÇÃO CONCLUÍDA!${NC}"
     echo "Edite o token em: nano $INSTALL_DIR/client.toml"
-    echo "Reinicie após editar: systemctl restart $SERVICE_NAME"
-    echo "Logs: journalctl -u $SERVICE_NAME -f"
+    echo "Reinicie: systemctl restart $SERVICE_NAME"
 else
-    echo -e "${RED}❌ Erro ao iniciar serviço.${NC}"
+    echo -e "${RED}❌ Erro ao iniciar serviço. Verifique 'journalctl -u $SERVICE_NAME'.${NC}"
     exit 1
 fi
