@@ -19,7 +19,7 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
-// --- CONFIGURAÇÕES ---
+// --- CONFIGURAÇÕES E CONSTANTES ---
 
 const (
 	CertDir    = "certs"
@@ -32,13 +32,14 @@ type Config struct {
 	ServerIP       string `toml:"server_ip"`
 	Token          string `toml:"token"`
 	Name           string `toml:"name"`
+	EnrollSecret   string `toml:"enroll_secret"` // --- NOVO: Segredo da Blindagem ---
 	ControlPort    string `toml:"control_port"`
 	EnrollPort     string `toml:"enroll_port"`
 	ReconnectDelay int    `toml:"reconnect_delay"`
 }
 
 func main() {
-	// 1. Configuração
+	// 1. Configuração Inicial
 	flagPath := flag.String("config", "client.toml", "Caminho do arquivo TOML")
 	flagIP := flag.String("server", "", "Sobrescreve Server IP")
 	flagToken := flag.String("token", "", "Sobrescreve Token")
@@ -47,7 +48,7 @@ func main() {
 
 	cfg := loadConfig(*flagPath)
 
-	// Overrides
+	// Overrides via flags
 	if *flagIP != "" {
 		cfg.ServerIP = *flagIP
 	}
@@ -73,8 +74,9 @@ func main() {
 	ensureCertDir()
 
 	// 2. BOOTSTRAP: Garantir CA (Loop de Retry)
+	// Passamos a config inteira agora para ter acesso ao EnrollSecret
 	for {
-		if err := ensureCACertificate(cfg.ServerIP, cfg.EnrollPort); err != nil {
+		if err := ensureCACertificate(cfg); err != nil {
 			log.Printf("[Boot] ⚠️  Falha ao baixar CA: %v. Tentando em 5s...", err)
 			time.Sleep(5 * time.Second)
 			continue
@@ -125,26 +127,37 @@ func fileExists(filename string) bool {
 	return !info.IsDir()
 }
 
-// ensureCACertificate baixa o CA público se ele não existir
-func ensureCACertificate(serverIP, port string) error {
+// ensureCACertificate baixa o CA público usando o Header de Proteção
+func ensureCACertificate(cfg Config) error {
 	if fileExists(CaFile) {
 		return nil
 	}
 
-	url := fmt.Sprintf("https://%s%s/ca.crt", serverIP, port)
+	url := fmt.Sprintf("https://%s%s/ca.crt", cfg.ServerIP, cfg.EnrollPort)
 	log.Printf("[Boot] 📥 Baixando CA de %s...", url)
 
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 
-	resp, err := client.Get(url)
+	// Criação da Request Manual para inserir Header
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	// --- BLINDAGEM: Injeta o segredo ---
+	if cfg.EnrollSecret != "" {
+		req.Header.Set("X-App-Secret", cfg.EnrollSecret)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("status HTTP %d", resp.StatusCode)
+		return fmt.Errorf("acesso negado ou erro (HTTP %d)", resp.StatusCode)
 	}
 
 	data, err := io.ReadAll(resp.Body)
@@ -167,7 +180,7 @@ func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 			// 1. Checa Validade (Data)
 			isExpired := time.Now().After(x509Cert.NotAfter)
 
-			// 2. Checa se o Nome mudou (CORREÇÃO DO BUG)
+			// 2. Checa se o Nome mudou
 			isNameMismatch := x509Cert.Subject.CommonName != cfg.Name
 
 			if !isExpired && !isNameMismatch {
@@ -188,7 +201,7 @@ func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 		}
 	}
 
-	// B) Matrícula (Enroll) - Só chega aqui se não existir ou for inválido/mudado
+	// B) Matrícula (Enroll)
 	log.Println("[Enroll] 📝 Solicitando novo certificado...")
 	enrollURL := fmt.Sprintf("https://%s%s/enroll", cfg.ServerIP, cfg.EnrollPort)
 
@@ -205,7 +218,20 @@ func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 	payload := map[string]string{"token": cfg.Token, "name": cfg.Name}
 	jsonData, _ := json.Marshal(payload)
 
-	resp, err := client.Post(enrollURL, "application/json", bytes.NewBuffer(jsonData))
+	// Criação da Request Manual para inserir Header
+	req, err := http.NewRequest("POST", enrollURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	// --- BLINDAGEM: Injeta o segredo ---
+	if cfg.EnrollSecret != "" {
+		req.Header.Set("X-App-Secret", cfg.EnrollSecret)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
