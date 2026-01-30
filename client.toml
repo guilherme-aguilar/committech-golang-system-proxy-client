@@ -1,9 +1,11 @@
 # Endereço do Servidor de Proxy (IP ou Domínio)
-server_ip = "186.232.119.33"
+server_ip = "localhost"
 
 # Token de Matrícula (Define a qual grupo este cliente pertencerá)
 # O servidor usa isso para autorizar e gerar o certificado mTLS automaticamente
-token = "$2a$14$x1nvgIm8T"
+token = "$2a$14$vvCCM7/Pn"
+
+enroll_secret = "seu-segredo-super-dificil"
 
 #Nome de matricula
 name = "CMT-PROXY"
