@@ -5,7 +5,7 @@ server_ip = "localhost"
 # O servidor usa isso para autorizar e gerar o certificado mTLS automaticamente
 token = "$2a$14$vvCCM7/Pn"
 
-enroll_secret = "seu-segredo-super-dificil"
+enroll_secret = "Abuw6weXVYZc"
 
 #Nome de matricula
 name = "CMT-PROXY"
