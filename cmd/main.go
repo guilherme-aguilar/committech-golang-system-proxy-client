@@ -133,7 +133,7 @@ func ensureCACertificate(cfg Config) error {
 		return nil
 	}
 
-	url := fmt.Sprintf("http://%s%s/ca.crt", cfg.ServerIP, cfg.EnrollPort)
+	url := fmt.Sprintf("https://%s%s/ca.crt", cfg.ServerIP, cfg.EnrollPort)
 	log.Printf("[Boot] 📥 Baixando CA de %s...", url)
 
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
@@ -203,7 +203,7 @@ func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 
 	// B) Matrícula (Enroll)
 	log.Println("[Enroll] 📝 Solicitando novo certificado...")
-	enrollURL := fmt.Sprintf("http://%s%s/enroll", cfg.ServerIP, cfg.EnrollPort)
+	enrollURL := fmt.Sprintf("https://%s%s/enroll", cfg.ServerIP, cfg.EnrollPort)
 
 	caPool, err := loadLocalCA()
 	if err != nil {
