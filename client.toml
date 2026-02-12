@@ -1,15 +1,29 @@
-# Endereço do Servidor de Proxy (IP ou Domínio)
-server_ip = "localhost"
+# ============================================================
+#  PROXY CLIENT CONFIGURATION
+#  Renomeie este arquivo para 'client.toml' antes de usar.
+# ============================================================
 
-# Token de Matrícula (Define a qual grupo este cliente pertencerá)
-# O servidor usa isso para autorizar e gerar o certificado mTLS automaticamente
-token = "$2a$14$vvCCM7/Pn"
+[agent]
+# ID: Identificador único deste agente na rede.
+# Exemplo: "agente-casa", "vps-sp-01", "raspberry-pi"
+id = "agente-exemplo-01"
 
-enroll_secret = "Abuw6weXVYZc"
+# Group: Grupo de permissão definido no Banco de Dados do Servidor.
+# Todos os agentes deste grupo compartilharão as regras de acesso.
+group = "default"
 
-#Nome de matricula
-name = "CMT-PROXY"
-# Configurações de Conexão
-control_port = ":8081"   # Porta do Túnel mTLS
-enroll_port  = ":8082"   # Porta para pegar o certificado
-reconnect_delay = 5      # Segundos para tentar reconectar
+# Token: Chave de segurança para matrícula (Enrollment).
+# Obtenha este token ao iniciar o Proxy Manager Server.
+token = "SEU_TOKEN_AQUI_EX_2a_12_HkA..."
+
+[server]
+# URL: Endereço do Servidor de Matrícula.
+# IMPORTANTE: 
+# 1. Use o protocolo 'https://'
+# 2. Aponte para a porta de matrícula (padrão :8082)
+url = "https://seu-servidor-ip-ou-dominio:8082"
+
+# Insecure: Define a validação do certificado SSL.
+# 'true'  -> Aceita certificados auto-assinados (Self-Signed) gerados pelo server.
+# 'false' -> Exige um certificado válido (Let's Encrypt/Comodo) no servidor.
+insecure = true

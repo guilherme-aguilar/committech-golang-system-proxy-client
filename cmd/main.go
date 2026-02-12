@@ -12,7 +12,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -28,53 +30,47 @@ const (
 	ClientKey  = "certs/client.key"
 )
 
+// Estrutura atualizada para bater com o novo client.toml
 type Config struct {
-	ServerIP       string `toml:"server_ip"`
-	Token          string `toml:"token"`
-	Name           string `toml:"name"`
-	EnrollSecret   string `toml:"enroll_secret"` // --- NOVO: Segredo da Blindagem ---
-	ControlPort    string `toml:"control_port"`
-	EnrollPort     string `toml:"enroll_port"`
-	ReconnectDelay int    `toml:"reconnect_delay"`
+	Agent  AgentConfig  `toml:"agent"`
+	Server ServerConfig `toml:"server"`
+}
+
+type AgentConfig struct {
+	ID    string `toml:"id"`
+	Group string `toml:"group"`
+	Token string `toml:"token"`
+}
+
+type ServerConfig struct {
+	URL      string `toml:"url"`      // Ex: https://177.104.176.87:8082
+	Insecure bool   `toml:"insecure"` // Ex: true
 }
 
 func main() {
 	// 1. Configuração Inicial
 	flagPath := flag.String("config", "client.toml", "Caminho do arquivo TOML")
-	flagIP := flag.String("server", "", "Sobrescreve Server IP")
-	flagToken := flag.String("token", "", "Sobrescreve Token")
-	flagName := flag.String("name", "", "Sobrescreve Nome")
 	flag.Parse()
 
 	cfg := loadConfig(*flagPath)
 
-	// Overrides via flags
-	if *flagIP != "" {
-		cfg.ServerIP = *flagIP
-	}
-	if *flagToken != "" {
-		cfg.Token = *flagToken
-	}
-	if *flagName != "" {
-		cfg.Name = *flagName
+	// Validação básica
+	if cfg.Server.URL == "" || cfg.Agent.Token == "" {
+		log.Fatal("❌ Erro: 'server.url' e 'agent.token' são obrigatórios no client.toml.")
 	}
 
-	if cfg.Name == "" {
+	// Define ID padrão se não houver
+	if cfg.Agent.ID == "" {
 		host, _ := os.Hostname()
-		cfg.Name = "proxy-" + host
+		cfg.Agent.ID = "proxy-" + host
 	}
 
-	if cfg.ServerIP == "" || cfg.Token == "" {
-		log.Fatal("❌ Erro: 'server_ip' e 'token' são obrigatórios.")
-	}
-
-	log.Printf("[Init] Iniciando Agente: %s -> %s", cfg.Name, cfg.ServerIP)
+	log.Printf("[Init] Iniciando Agente: %s -> %s", cfg.Agent.ID, cfg.Server.URL)
 
 	// Cria pasta certs se não existir
 	ensureCertDir()
 
 	// 2. BOOTSTRAP: Garantir CA (Loop de Retry)
-	// Passamos a config inteira agora para ter acesso ao EnrollSecret
 	for {
 		if err := ensureCACertificate(cfg); err != nil {
 			log.Printf("[Boot] ⚠️  Falha ao baixar CA: %v. Tentando em 5s...", err)
@@ -99,19 +95,20 @@ func main() {
 	}
 
 	// 4. CONEXÃO: Túnel (Loop Infinito)
-	tunnelAddr := fmt.Sprintf("%s%s", cfg.ServerIP, cfg.ControlPort)
+	// Precisamos descobrir o endereço do túnel (Porta 8081) baseado na URL de matrícula
+	tunnelAddr := getTunnelAddress(cfg.Server.URL)
 
 	for {
 		log.Printf("[Tunnel] 🔌 Conectando a %s...", tunnelAddr)
-		err := connectTunnel(tunnelAddr, clientIdentity)
+		err := connectTunnel(tunnelAddr, clientIdentity, cfg)
 
 		log.Printf("[Tunnel] ❌ Desconectado: %v", err)
-		log.Printf("[Tunnel] ⏳ Reconectando em %ds...", cfg.ReconnectDelay)
-		time.Sleep(time.Duration(cfg.ReconnectDelay) * time.Second)
+		log.Printf("[Tunnel] ⏳ Reconectando em 5s...")
+		time.Sleep(5 * time.Second)
 	}
 }
 
-// --- FUNÇÕES DE ARQUIVO E CERTIFICADO ---
+// --- FUNÇÕES AUXILIARES ---
 
 func ensureCertDir() {
 	if _, err := os.Stat(CertDir); os.IsNotExist(err) {
@@ -127,30 +124,46 @@ func fileExists(filename string) bool {
 	return !info.IsDir()
 }
 
-// ensureCACertificate baixa o CA público usando o Header de Proteção
+// Formata URL garantindo que não duplique https://
+func formatURL(base, path string) string {
+	base = strings.TrimRight(base, "/")
+	if !strings.HasPrefix(base, "http") {
+		base = "https://" + base
+	}
+	return base + path
+}
+
+// Pega a URL de matrícula (ex: :8082) e converte para endereço do túnel (ex: :8081)
+func getTunnelAddress(enrollURL string) string {
+	u, err := url.Parse(enrollURL)
+	if err != nil {
+		// Fallback se a URL for inválida (assume que é só IP)
+		return enrollURL + ":8081"
+	}
+	// Pega apenas o Host (IP ou Domínio)
+	hostname := u.Hostname()
+	// Retorna com a porta do túnel padrão 8081
+	return fmt.Sprintf("%s:8081", hostname)
+}
+
+// --- CERTIFICADOS E MATRÍCULA ---
+
 func ensureCACertificate(cfg Config) error {
-	if fileExists(CaFile) {
+	// Se arquivo existe e tem conteúdo, pula
+	if info, err := os.Stat(CaFile); err == nil && info.Size() > 0 {
 		return nil
 	}
 
-	url := fmt.Sprintf("https://%s%s/ca.crt", cfg.ServerIP, cfg.EnrollPort)
+	url := formatURL(cfg.Server.URL, "/ca.crt")
 	log.Printf("[Boot] 📥 Baixando CA de %s...", url)
 
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	// IMPORTANTE: Insecure=true para o primeiro download (CA Self-Signed)
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
 	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 
-	// Criação da Request Manual para inserir Header
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-
-	// --- BLINDAGEM: Injeta o segredo ---
-	if cfg.EnrollSecret != "" {
-		req.Header.Set("X-App-Secret", cfg.EnrollSecret)
-	}
-
-	resp, err := client.Do(req)
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}
@@ -165,73 +178,58 @@ func ensureCACertificate(cfg Config) error {
 		return err
 	}
 
+	ensureCertDir()
 	return os.WriteFile(CaFile, data, 0644)
 }
 
-// loadOrEnroll tenta ler do disco. Se falhar ou NOME MUDAR, pede novo.
 func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 	// A) Tenta carregar do disco
 	if fileExists(ClientCert) && fileExists(ClientKey) {
 		cert, err := tls.LoadX509KeyPair(ClientCert, ClientKey)
 		if err == nil {
-			// Parse do x509 para checar validade e NOME
 			x509Cert, _ := x509.ParseCertificate(cert.Certificate[0])
-
-			// 1. Checa Validade (Data)
 			isExpired := time.Now().After(x509Cert.NotAfter)
 
-			// 2. Checa se o Nome mudou
-			isNameMismatch := x509Cert.Subject.CommonName != cfg.Name
+			// Se o nome no arquivo for diferente do Config, renova
+			isNameMismatch := x509Cert.Subject.CommonName != cfg.Agent.ID
 
 			if !isExpired && !isNameMismatch {
 				log.Println("[Auth] ✅ Identidade válida carregada do disco.")
 				return cert, nil
 			}
-
-			if isExpired {
-				log.Println("[Auth] ⚠️  Certificado expirou. Renovando...")
-			}
-			if isNameMismatch {
-				log.Printf("[Auth] ⚠️  Nome alterado (De: '%s' Para: '%s'). Renovando...",
-					x509Cert.Subject.CommonName, cfg.Name)
-			}
-
-		} else {
-			log.Printf("[Auth] ⚠️  Certificado corrompido: %v", err)
+			log.Println("[Auth] ⚠️  Certificado inválido ou expirado. Renovando...")
 		}
 	}
 
 	// B) Matrícula (Enroll)
 	log.Println("[Enroll] 📝 Solicitando novo certificado...")
-	enrollURL := fmt.Sprintf("https://%s%s/enroll", cfg.ServerIP, cfg.EnrollPort)
+	enrollURL := formatURL(cfg.Server.URL, "/enroll")
 
+	// Carrega o CA que acabamos de baixar
 	caPool, err := loadLocalCA()
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 
+	// Configura TLS: Se Insecure=true no TOML, ignora validação do Server
+	tlsConfig := &tls.Config{RootCAs: caPool}
+	if cfg.Server.Insecure {
+		tlsConfig.InsecureSkipVerify = true
+	}
+
 	client := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: caPool}},
+		Transport: &http.Transport{TLSClientConfig: tlsConfig},
 		Timeout:   10 * time.Second,
 	}
 
-	payload := map[string]string{"token": cfg.Token, "name": cfg.Name}
+	payload := map[string]string{
+		"token": cfg.Agent.Token,
+		"name":  cfg.Agent.ID,
+		"group": cfg.Agent.Group,
+	}
 	jsonData, _ := json.Marshal(payload)
 
-	// Criação da Request Manual para inserir Header
-	req, err := http.NewRequest("POST", enrollURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	// --- BLINDAGEM: Injeta o segredo ---
-	if cfg.EnrollSecret != "" {
-		req.Header.Set("X-App-Secret", cfg.EnrollSecret)
-	}
-
-	resp, err := client.Do(req)
+	resp, err := client.Post(enrollURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -269,16 +267,22 @@ func loadLocalCA() (*x509.CertPool, error) {
 
 // --- LÓGICA DO TÚNEL ---
 
-func connectTunnel(addr string, cert tls.Certificate) error {
+func connectTunnel(addr string, cert tls.Certificate, cfg Config) error {
 	caPool, err := loadLocalCA()
 	if err != nil {
 		return err
 	}
 
-	conn, err := tls.Dial("tcp", addr, &tls.Config{
+	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      caPool,
-	})
+	}
+	// Se Insecure=true, aceita conectar no túnel sem verificar o hostname do servidor
+	if cfg.Server.Insecure {
+		tlsConfig.InsecureSkipVerify = true
+	}
+
+	conn, err := tls.Dial("tcp", addr, tlsConfig)
 	if err != nil {
 		return err
 	}
@@ -356,13 +360,11 @@ func handleHTTP(stream net.Conn, req *http.Request) {
 }
 
 func loadConfig(path string) Config {
-	cfg := Config{
-		ControlPort:    ":8081",
-		EnrollPort:     ":8082",
-		ReconnectDelay: 5,
-	}
+	var cfg Config
 	if fileExists(path) {
-		toml.DecodeFile(path, &cfg)
+		if _, err := toml.DecodeFile(path, &cfg); err != nil {
+			log.Printf("⚠️ Erro ao ler config TOML: %v", err)
+		}
 	}
 	return cfg
 }
