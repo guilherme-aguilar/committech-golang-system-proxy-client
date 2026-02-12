@@ -21,8 +21,7 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
-// --- CONFIGURAÇÕES E CONSTANTES ---
-
+// --- CONSTANTES ---
 const (
 	CertDir    = "certs"
 	CaFile     = "certs/ca.crt"
@@ -30,7 +29,7 @@ const (
 	ClientKey  = "certs/client.key"
 )
 
-// Estrutura atualizada para bater com o novo client.toml
+// --- CONFIGURAÇÃO ---
 type Config struct {
 	Agent  AgentConfig  `toml:"agent"`
 	Server ServerConfig `toml:"server"`
@@ -43,23 +42,22 @@ type AgentConfig struct {
 }
 
 type ServerConfig struct {
-	URL      string `toml:"url"`      // Ex: https://177.104.176.87:8082
-	Insecure bool   `toml:"insecure"` // Ex: true
+	URL      string `toml:"url"`      // Ex: https://177.104...:8082
+	Insecure bool   `toml:"insecure"` // Aceitar certificado auto-assinado
+	Secret   string `toml:"secret"`   // Segredo da Blindagem (Novo!)
 }
 
 func main() {
-	// 1. Configuração Inicial
+	// 1. Carrega Configuração
 	flagPath := flag.String("config", "client.toml", "Caminho do arquivo TOML")
 	flag.Parse()
 
 	cfg := loadConfig(*flagPath)
 
-	// Validação básica
+	// Validações Básicas
 	if cfg.Server.URL == "" || cfg.Agent.Token == "" {
 		log.Fatal("❌ Erro: 'server.url' e 'agent.token' são obrigatórios no client.toml.")
 	}
-
-	// Define ID padrão se não houver
 	if cfg.Agent.ID == "" {
 		host, _ := os.Hostname()
 		cfg.Agent.ID = "proxy-" + host
@@ -67,7 +65,6 @@ func main() {
 
 	log.Printf("[Init] Iniciando Agente: %s -> %s", cfg.Agent.ID, cfg.Server.URL)
 
-	// Cria pasta certs se não existir
 	ensureCertDir()
 
 	// 2. BOOTSTRAP: Garantir CA (Loop de Retry)
@@ -95,7 +92,6 @@ func main() {
 	}
 
 	// 4. CONEXÃO: Túnel (Loop Infinito)
-	// Precisamos descobrir o endereço do túnel (Porta 8081) baseado na URL de matrícula
 	tunnelAddr := getTunnelAddress(cfg.Server.URL)
 
 	for {
@@ -124,7 +120,7 @@ func fileExists(filename string) bool {
 	return !info.IsDir()
 }
 
-// Formata URL garantindo que não duplique https://
+// Garante formato correto da URL (sempre com https://)
 func formatURL(base, path string) string {
 	base = strings.TrimRight(base, "/")
 	if !strings.HasPrefix(base, "http") {
@@ -133,23 +129,30 @@ func formatURL(base, path string) string {
 	return base + path
 }
 
-// Pega a URL de matrícula (ex: :8082) e converte para endereço do túnel (ex: :8081)
+// Converte URL de Enroll (:8082) para Porta do Túnel (:8081)
 func getTunnelAddress(enrollURL string) string {
 	u, err := url.Parse(enrollURL)
 	if err != nil {
-		// Fallback se a URL for inválida (assume que é só IP)
+		// Fallback se não conseguir parsear
 		return enrollURL + ":8081"
 	}
-	// Pega apenas o Host (IP ou Domínio)
-	hostname := u.Hostname()
-	// Retorna com a porta do túnel padrão 8081
-	return fmt.Sprintf("%s:8081", hostname)
+	return fmt.Sprintf("%s:8081", u.Hostname())
 }
 
-// --- CERTIFICADOS E MATRÍCULA ---
+func loadConfig(path string) Config {
+	var cfg Config
+	if fileExists(path) {
+		if _, err := toml.DecodeFile(path, &cfg); err != nil {
+			log.Printf("⚠️ Erro ao ler config TOML: %v", err)
+		}
+	}
+	return cfg
+}
+
+// --- LÓGICA DE CERTIFICADOS E MATRÍCULA ---
 
 func ensureCACertificate(cfg Config) error {
-	// Se arquivo existe e tem conteúdo, pula
+	// Se arquivo já existe, ok
 	if info, err := os.Stat(CaFile); err == nil && info.Size() > 0 {
 		return nil
 	}
@@ -157,7 +160,7 @@ func ensureCACertificate(cfg Config) error {
 	url := formatURL(cfg.Server.URL, "/ca.crt")
 	log.Printf("[Boot] 📥 Baixando CA de %s...", url)
 
-	// IMPORTANTE: Insecure=true para o primeiro download (CA Self-Signed)
+	// Cliente HTTP Inseguro (apenas para baixar o CA inicial)
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
@@ -189,15 +192,13 @@ func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 		if err == nil {
 			x509Cert, _ := x509.ParseCertificate(cert.Certificate[0])
 			isExpired := time.Now().After(x509Cert.NotAfter)
-
-			// Se o nome no arquivo for diferente do Config, renova
 			isNameMismatch := x509Cert.Subject.CommonName != cfg.Agent.ID
 
 			if !isExpired && !isNameMismatch {
 				log.Println("[Auth] ✅ Identidade válida carregada do disco.")
 				return cert, nil
 			}
-			log.Println("[Auth] ⚠️  Certificado inválido ou expirado. Renovando...")
+			log.Println("[Auth] ⚠️  Certificado inválido, expirado ou nome mudou. Renovando...")
 		}
 	}
 
@@ -205,13 +206,12 @@ func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 	log.Println("[Enroll] 📝 Solicitando novo certificado...")
 	enrollURL := formatURL(cfg.Server.URL, "/enroll")
 
-	// Carrega o CA que acabamos de baixar
 	caPool, err := loadLocalCA()
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 
-	// Configura TLS: Se Insecure=true no TOML, ignora validação do Server
+	// Configura TLS com CA confiável (ou Insecure se configurado)
 	tlsConfig := &tls.Config{RootCAs: caPool}
 	if cfg.Server.Insecure {
 		tlsConfig.InsecureSkipVerify = true
@@ -229,7 +229,19 @@ func loadOrEnroll(cfg Config) (tls.Certificate, error) {
 	}
 	jsonData, _ := json.Marshal(payload)
 
-	resp, err := client.Post(enrollURL, "application/json", bytes.NewBuffer(jsonData))
+	// CORREÇÃO CRÍTICA: Criar Request manual para injetar o Header
+	req, err := http.NewRequest("POST", enrollURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// --- AQUI VAI O SEGREDO DA BLINDAGEM ---
+	if cfg.Server.Secret != "" {
+		req.Header.Set("X-App-Secret", cfg.Server.Secret)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -277,7 +289,7 @@ func connectTunnel(addr string, cert tls.Certificate, cfg Config) error {
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      caPool,
 	}
-	// Se Insecure=true, aceita conectar no túnel sem verificar o hostname do servidor
+	// Se Insecure=true, ignora validação de hostname no túnel também
 	if cfg.Server.Insecure {
 		tlsConfig.InsecureSkipVerify = true
 	}
@@ -357,14 +369,4 @@ func handleHTTP(stream net.Conn, req *http.Request) {
 	defer resp.Body.Close()
 
 	resp.Write(stream)
-}
-
-func loadConfig(path string) Config {
-	var cfg Config
-	if fileExists(path) {
-		if _, err := toml.DecodeFile(path, &cfg); err != nil {
-			log.Printf("⚠️ Erro ao ler config TOML: %v", err)
-		}
-	}
-	return cfg
 }

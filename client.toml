@@ -1,20 +1,18 @@
 # ============================================================
 #  PROXY CLIENT CONFIGURATION
-#  Renomeie este arquivo para 'client.toml' antes de usar.
+#  Instrução: Renomeie este arquivo para 'client.toml'
 # ============================================================
 
 [agent]
-# ID: Identificador único deste agente na rede.
-# Exemplo: "agente-casa", "vps-sp-01", "raspberry-pi"
+# ID: Identificador único deste agente (ex: "agente-casa", "vps-01").
 id = "agente-exemplo-01"
 
-# Group: Grupo de permissão definido no Banco de Dados do Servidor.
-# Todos os agentes deste grupo compartilharão as regras de acesso.
-group = "default"
+# Group: Grupo de permissão (deve existir no servidor ou ser criado via token).
+group = "whatsapp"
 
 # Token: Chave de segurança para matrícula (Enrollment).
 # Obtenha este token ao iniciar o Proxy Manager Server.
-token = "SEU_TOKEN_AQUI_EX_2a_12_HkA..."
+token = "SEU_TOKEN_DE_MATRICULA_AQUI"
 
 [server]
 # URL: Endereço do Servidor de Matrícula.
@@ -24,6 +22,11 @@ token = "SEU_TOKEN_AQUI_EX_2a_12_HkA..."
 url = "https://seu-servidor-ip-ou-dominio:8082"
 
 # Insecure: Define a validação do certificado SSL.
-# 'true'  -> Aceita certificados auto-assinados (Self-Signed) gerados pelo server.
-# 'false' -> Exige um certificado válido (Let's Encrypt/Comodo) no servidor.
+# 'true' -> Aceita certificados auto-assinados (Self-Signed) do servidor.
+# 'false' -> Exige certificado válido (apenas se usar domínio com SSL real).
 insecure = true
+
+# Secret: Senha de Blindagem (Enroll Secret).
+# Deve ser IDÊNTICA ao valor 'enroll_secret' no arquivo server.toml do servidor.
+# Sem isso, o servidor recusará a conexão com erro 404.
+secret = "SEU_ENROLL_SECRET_AQUI"
